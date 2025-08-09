@@ -4,21 +4,26 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Context;
+use clap::{Parser, Subcommand};
 use gst::MessageView;
 use gstreamer as gst;
 use gstreamer::glib::object::Cast;
 use gstreamer::prelude::{ElementExt, ElementExtManual, GstBinExtManual};
 use nix::poll::{PollFd, PollFlags, PollTimeout};
 
-fn usage() {
-    eprintln!(
-        "Usage: qubes-streaming [--produce|--receive]
+#[derive(Parser)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
 
-Arguments:
-    --produce       Capture the first monitor and send raw video to stdout
-    --receive       Receive raw video in stdin and send to Twitch
-"
-    );
+#[derive(Subcommand)]
+enum Commands {
+    Produce,
+    Receive {
+        twitch_server: String,
+        twitch_key: String,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -29,28 +34,16 @@ fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let argument = match std::env::args().nth(1) {
-        Some(arg) => {
-            if arg != "--produce" && arg != "--receive" {
-                eprintln!("ERROR: Unknown argument '{}'\n\n", arg);
-                usage();
-                return Ok(());
-            }
-
-            arg
-        }
-        None => {
-            usage();
-            return Ok(());
-        }
-    };
+    let args = Cli::parse();
 
     gst::init()?;
 
-    if argument == "--produce" {
-        producer()
-    } else {
-        receiver()
+    match args.command {
+        Commands::Produce => producer(),
+        Commands::Receive {
+            twitch_server,
+            twitch_key,
+        } => receiver(&twitch_server, &twitch_key),
     }
 }
 
@@ -116,6 +109,10 @@ fn probe_videoinfo() -> anyhow::Result<VideoInfo> {
                         tracing::error!(?err);
                         gst::FlowError::Error
                     })?;
+
+                    // structure.iter().for_each(|field| {
+                    //     tracing::debug!("field = {:?}, value = {:?}", field.0, field.1);
+                    // });
 
                     tx.send(VideoInfo {
                         width,
@@ -318,7 +315,7 @@ fn producer() -> anyhow::Result<()> {
 }
 
 /// Capture the monitor, encode and generate fragmented MP4 media
-fn receiver() -> anyhow::Result<()> {
+fn receiver(twitch_server: &String, twitch_key: &String) -> anyhow::Result<()> {
     let video_info = recv_stream_videoinfo()?;
     tracing::info!(?video_info, "received video info");
 
@@ -330,17 +327,18 @@ fn receiver() -> anyhow::Result<()> {
 
     let videosrc = gst::ElementFactory::make("fdsrc")
         .property("fd", 0i32)
+        .property("is-live", false)
         .build()?;
 
     let stdin_videoconfig = gst::ElementFactory::make("capsfilter")
         .property(
             "caps",
             gst::Caps::builder("video/x-raw")
+                .field("format", &video_info.format)
                 .field("width", &video_info.width)
                 .field("height", &video_info.height)
-                .field("format", &video_info.format)
-                .field("pixel-aspect-ratio", gst::Fraction::new(1, 1))
                 .field("framerate", gst::Fraction::new(framerate, 1))
+                .field("colorimetry", "sRGB")
                 .build(),
         )
         .build()?;
@@ -380,11 +378,11 @@ fn receiver() -> anyhow::Result<()> {
         .property(
             "caps",
             gst::Caps::builder("video/x-raw")
+                .field("format", &video_info.format)
                 .field("width", &video_info.width)
                 .field("height", &video_info.height)
-                .field("format", &video_info.format)
-                .field("pixel-aspect-ratio", gst::Fraction::new(1, 1))
                 .field("framerate", gst::Fraction::new(framerate, 1))
+                .field("colorimetry", "sRGB")
                 .build(),
         )
         .build()?;
@@ -396,26 +394,75 @@ fn receiver() -> anyhow::Result<()> {
             "caps",
             gst::Caps::builder("video/x-raw")
                 .field("format", if has_nvcodec { "NV12" } else { "I420" })
+                .field("colorimetry", if has_nvcodec { "bt601" } else { "bt709" })
+                .field("range", "full")
                 .build(),
         )
         .build()?;
 
     let videoenc = if has_nvcodec {
-        gst::ElementFactory::make("nvh264enc").build()?
+        tracing::debug!("using nvcodec");
+        gst::ElementFactory::make("nvh264enc")
+            .property("bitrate", 99000u32)
+            .build()?
     } else {
-        gst::ElementFactory::make("openh264enc").build()?
+        gst::ElementFactory::make("openh264enc")
+            .property("bitrate", 4500000u32)
+            .property("max-bitrate", 6000000u32)
+            .property_from_str("complexity", "high")
+            .property_from_str("usage-type", "screen")
+            .build()?
     };
 
-    let videoh264parse = gst::ElementFactory::make("h264parse").build()?;
+    let rawvideoparsequeue = gst::ElementFactory::make("queue")
+        .property("max-size-bytes", 1048576000u32)
+        .property("max-size-buffers", 10000u32)
+        .property("max-size-time", 10000000000u64)
+        .property_from_str("leaky", "no")
+        .build()?;
 
+    // let videoh264parse = gst::ElementFactory::make("h264parse").build()?;
+    //
+    // let h264caps = gst::ElementFactory::make("capsfilter")
+    //     .property(
+    //         "caps",
+    //         gst::Caps::builder("video/x-h264")
+    //             .field("profile", "high")
+    //             .build(),
+    //     )
+    //     .build()?;
+    // let h264caps2 = gst::ElementFactory::make("capsfilter")
+    //     .property(
+    //         "caps",
+    //         gst::Caps::builder("video/x-h264")
+    //             .field("profile", "high")
+    //             .build(),
+    //     )
+    //     .build()?;
+    //
     let videomuxer = gst::ElementFactory::make("flvmux")
         .property("streamable", true)
         .build()?;
-    let videoqueue = gst::ElementFactory::make("queue").build()?;
 
-    let sink = gst::ElementFactory::make("filesink")
-        .property_from_str("location", "out.flv")
+    let sinkqueue = gst::ElementFactory::make("queue").build()?;
+
+    let videoqueue = gst::ElementFactory::make("queue")
+        .property("max-size-bytes", 1048576000u32)
+        .property("max-size-buffers", 10000u32)
+        .property("max-size-time", 10000000000u64)
+        .property_from_str("leaky", "no")
         .build()?;
+
+    let sink = gst::ElementFactory::make("rtmp2sink")
+        .property_from_str(
+            "location",
+            format!("rtmps://{}/app/{}", twitch_server, twitch_key).as_ref(),
+        )
+        .build()?;
+
+    // let sink = gst::ElementFactory::make("filesink")
+    //     .property_from_str("location", "out.flv")
+    //     .build()?;
 
     pipeline
         .add_many(&[
@@ -428,13 +475,17 @@ fn receiver() -> anyhow::Result<()> {
             &resampleconfig,
             &audioqueue,
             &audiocompress,
+            &rawvideoparsequeue,
             &rawvideoparse,
             &videoconvertconfig,
             &videoconvert,
             &videoqueue,
             &videoenc,
+            // &h264caps,
+            // &h264caps2,
             &videomuxer,
-            &videoh264parse,
+            // &videoh264parse,
+            &sinkqueue,
             &sink,
         ])
         .context("add_many()")?;
@@ -452,6 +503,7 @@ fn receiver() -> anyhow::Result<()> {
 
     gst::Element::link_many(&[
         &videosrc,
+        &rawvideoparsequeue,
         &stdin_videoconfig,
         &rawvideoparse,
         &stdin_videoconfig2,
@@ -459,12 +511,15 @@ fn receiver() -> anyhow::Result<()> {
         &videoconvertconfig,
         &videoqueue,
         &videoenc,
-        &videoh264parse,
+        // &h264caps,
+        // &videoh264parse,
+        // &h264caps2,
         &videomuxer,
     ])
     .context("link_many()")?;
 
-    videomuxer.link(&sink)?;
+    videomuxer.link(&sinkqueue)?;
+    sinkqueue.link(&sink)?;
 
     let should_exit = Arc::new(AtomicBool::new(false));
 
