@@ -349,11 +349,17 @@ fn receiver(twitch_server: &String, twitch_key: &String) -> anyhow::Result<()> {
 
     let audiosrc = gst::ElementFactory::make("pulsesrc").build()?;
     let audioconvert = gst::ElementFactory::make("audioconvert").build()?;
+    let audioconvert_afterfilter = gst::ElementFactory::make("audioconvert").build()?;
     let audioresample = gst::ElementFactory::make("audioresample").build()?;
     let caps = gst::Caps::builder("audio/x-raw")
         .field("rate", 48000i32)
         .field("channels", 2i32)
         .build();
+
+    let audio_lowpassfilter = gst::ElementFactory::make("audiocheblimit")
+        .property("cutoff", 20000.0f32)
+        .property("poles", 4i32)
+        .build()?;
 
     let resampleconfig = gst::ElementFactory::make("capsfilter")
         .property("caps", &caps)
@@ -364,6 +370,8 @@ fn receiver(twitch_server: &String, twitch_key: &String) -> anyhow::Result<()> {
         .build()?;
 
     let audioqueue = gst::ElementFactory::make("queue").build()?;
+
+    let audioequalizer = gst::ElementFactory::make("equalizer-10bands").build()?;
 
     // let videoconvert = gst::ElementFactory::make("videoconvert")
     //     .property_from_str("chroma-resampler", "lanczos")
@@ -439,12 +447,10 @@ fn receiver(twitch_server: &String, twitch_key: &String) -> anyhow::Result<()> {
     //             .build(),
     //     )
     //     .build()?;
-    //
+
     let videomuxer = gst::ElementFactory::make("flvmux")
         .property("streamable", true)
         .build()?;
-
-    let sinkqueue = gst::ElementFactory::make("queue").build()?;
 
     let videoqueue = gst::ElementFactory::make("queue")
         .property("max-size-bytes", 1048576000u32)
@@ -453,16 +459,24 @@ fn receiver(twitch_server: &String, twitch_key: &String) -> anyhow::Result<()> {
         .property_from_str("leaky", "no")
         .build()?;
 
-    let sink = gst::ElementFactory::make("rtmp2sink")
+    let rtmp_sink = gst::ElementFactory::make("rtmp2sink")
         .property_from_str(
             "location",
             format!("rtmps://{}/app/{}", twitch_server, twitch_key).as_ref(),
         )
         .build()?;
 
-    // let sink = gst::ElementFactory::make("filesink")
-    //     .property_from_str("location", "out.flv")
-    //     .build()?;
+    let streamtee = gst::ElementFactory::make("tee").build()?;
+    let rtmp_queue = gst::ElementFactory::make("queue").build()?;
+    let file_queue = gst::ElementFactory::make("queue").build()?;
+
+    let file_name = chrono::Local::now()
+        .format("%Y-%m-%d.stream.flv")
+        .to_string();
+
+    let file_sink = gst::ElementFactory::make("filesink")
+        .property_from_str("location", &file_name)
+        .build()?;
 
     pipeline
         .add_many(&[
@@ -471,10 +485,13 @@ fn receiver(twitch_server: &String, twitch_key: &String) -> anyhow::Result<()> {
             &stdin_videoconfig2,
             &audiosrc,
             &audioconvert,
+            &audioconvert_afterfilter,
+            &audio_lowpassfilter,
             &audioresample,
             &resampleconfig,
             &audioqueue,
             &audiocompress,
+            &audioequalizer,
             &rawvideoparsequeue,
             &rawvideoparse,
             &videoconvertconfig,
@@ -485,14 +502,20 @@ fn receiver(twitch_server: &String, twitch_key: &String) -> anyhow::Result<()> {
             // &h264caps2,
             &videomuxer,
             // &videoh264parse,
-            &sinkqueue,
-            &sink,
+            &rtmp_queue,
+            &file_queue,
+            &streamtee,
+            &rtmp_sink,
+            &file_sink,
         ])
         .context("add_many()")?;
 
     gst::Element::link_many(&[
         &audiosrc,
         &audioconvert,
+        &audio_lowpassfilter,
+        &audioconvert_afterfilter,
+        &audioequalizer,
         &audioresample,
         &resampleconfig,
         &audioqueue,
@@ -518,8 +541,12 @@ fn receiver(twitch_server: &String, twitch_key: &String) -> anyhow::Result<()> {
     ])
     .context("link_many()")?;
 
-    videomuxer.link(&sinkqueue)?;
-    sinkqueue.link(&sink)?;
+    videomuxer.link(&streamtee)?;
+    streamtee.link(&rtmp_queue)?;
+    streamtee.link(&file_queue)?;
+
+    rtmp_queue.link(&rtmp_sink)?;
+    file_queue.link(&file_sink)?;
 
     let should_exit = Arc::new(AtomicBool::new(false));
 

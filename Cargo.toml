@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.98"
+chrono = "0.4.41"
 clap = { version = "4.5.43", features = ["derive"] }
 gstreamer = { git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs.git", tag = "0.24.0", version = "0.24.0" }
 gstreamer-app = { git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs.git", tag = "0.24.0", version = "0.24.0" }
